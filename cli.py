@@ -4,6 +4,14 @@ import re
 from anthropic import AsyncAnthropic
 from anthropic.types import TextBlock
 import json
+from rich.console import Console
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.status import Status
+
+# Initialize rich console
+console = Console()
 
 # Initialize the Anthropic client with the API key from the environment
 client = AsyncAnthropic(
@@ -173,7 +181,7 @@ For each file, respond with a JSON array of objects containing:
             messages=[message],
             model="claude-3-5-sonnet-latest"
         )
-        print(f"Received response: {response.content[0].text}")
+        console.print(f"[dim]Received response: {response.content[0].text}[/dim]")
         
         # Handle different response content types
         try:
@@ -198,7 +206,7 @@ For each file, respond with a JSON array of objects containing:
                 # Unknown content type, fallback to medium relevance
                 file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
-            print(f"Error processing response: {str(e)}")
+            console.print(f"[red]Error processing response: {str(e)}[/red]")
             # Fallback to medium relevance if parsing fails
             file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
     
@@ -292,16 +300,74 @@ async def validate_ai_response(response: str):
     )
     return corrected_response.content
 
+def format_explanation(explanation: str) -> Panel:
+    """Format the explanation section in a panel."""
+    return Panel(explanation, title="Task Explanation", border_style="blue")
+
+def format_files_modified(files: list) -> Table:
+    """Format the files modified section as a table."""
+    table = Table(title="Files to be Modified", show_header=True, header_style="bold magenta")
+    table.add_column("File Path", style="cyan")
+    table.add_column("Status", style="green")
+    
+    for file in files:
+        if isinstance(file, str):
+            table.add_row(file, "To be modified")
+        elif isinstance(file, dict):
+            table.add_row(file.get('path', 'Unknown'), file.get('status', 'To be modified'))
+    
+    return table
+
+def format_codebase_analysis(analysis: str) -> Panel:
+    """Format the codebase analysis section with syntax highlighting."""
+    if isinstance(analysis, dict):
+        analysis = json.dumps(analysis, indent=2)
+    
+    syntax = Syntax(analysis, "json", theme="monokai", word_wrap=True)
+    return Panel(syntax, title="Codebase Analysis", border_style="green")
+
 async def display_final_plan(plan: str):
-    """Display the final plan."""
-    print("\n--- Task Plan ---")
-    print(plan)
-    print("\nPlease review the plan and proceed with the necessary actions.")
+    """Display the final plan with rich formatting."""
+    try:
+        with Status("[bold blue]Formatting task plan...", console=console):
+            # Parse the plan JSON
+            plan_data = json.loads(plan) if isinstance(plan, str) else plan
+            
+            # Clear the screen for better presentation
+            console.clear()
+            
+            # Display title
+            console.print("\n[bold cyan]Task Plan Summary[/bold cyan]", justify="center")
+            console.print("=" * 80, justify="center")
+            
+            # Display each section
+            console.print(format_explanation(plan_data.get('explanation', 'No explanation provided')))
+            console.print()
+            
+            console.print(format_files_modified(plan_data.get('files_modified', [])))
+            console.print()
+            
+            console.print(format_codebase_analysis(plan_data.get('codebase_analysis', '{}')))
+            
+            console.print("\n[bold green]Please review the plan and proceed with the necessary actions.[/bold green]")
+    
+    except json.JSONDecodeError:
+        console.print(Panel(
+            "[red]Error: Invalid plan format[/red]\n\nRaw plan content:\n" + str(plan),
+            title="Error",
+            border_style="red"
+        ))
+    except Exception as e:
+        console.print(Panel(
+            f"[red]An unexpected error occurred:[/red]\n{str(e)}",
+            title="Error",
+            border_style="red"
+        ))
 
 async def main():
     task_description = input("Enter the task description: ")
     codebase_summary = await explore_codebase(task_description=task_description)
-    print(f"Found {len(codebase_summary)} relevant files in the codebase.")
+    console.print(f"[green]Found {len(codebase_summary)} relevant files in the codebase.[/green]")
     plan = await generate_task_plan(task_description, codebase_summary)
     valid_plan = await validate_ai_response(plan)
     await display_final_plan(valid_plan)
