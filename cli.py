@@ -1,4 +1,5 @@
 import os
+import logging
 import asyncio
 import re
 from anthropic import AsyncAnthropic
@@ -6,14 +7,18 @@ from anthropic.types import TextBlock
 import json
 from rich.console import Console
 from rich.panel import Panel
-from rich.syntax import Syntax
 from rich.table import Table
 from rich.status import Status
+from pygments.styles.monokai import MonokaiStyle
+from rich.syntax import Syntax, SyntaxTheme
+from rich.style import Style
 
 # Initialize rich console
 console = Console()
 
-# Initialize the Anthropic client with the API key from the environment
+# Configure logging
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+
 client = AsyncAnthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY")
 )
@@ -37,6 +42,7 @@ async def read_file_snippet(file_path, start_line=0, num_lines=10):
                     break
                 lines.append(line.strip())
     except Exception as e:
+        logging.error(f"Error reading file {file_path}: {str(e)}")
         return f"Error reading file: {str(e)}"
     return '\n'.join(lines)
 
@@ -70,6 +76,7 @@ async def scan_file_content(file_path, keywords):
                     
         return snippets
     except Exception as e:
+        logging.error(f"Error scanning file {file_path}: {str(e)}")
         return []
 
 async def process_file(file_path, code_extensions, text_extensions, keywords, semaphore):
@@ -104,6 +111,7 @@ async def process_file(file_path, code_extensions, text_extensions, keywords, se
                 'snippets': snippets
             }
         except Exception as e:
+            logging.error(f"Error processing file {file_path}: {str(e)}")
             return {'path': file_path, 'error': str(e)}
 
 file_cache = {}
@@ -147,7 +155,7 @@ async def explore_codebase(root_dir='.', task_description=''):
             file_cache[cache_key] = file_summary
     
     # Filter out files with no relevant snippets
-    relevant_files = [f for f in codebase_summary if f.get('snippets', [])]
+    relevant_files = [f for f in codebase_summary if isinstance(f, dict) and f.get('snippets', [])]
     return relevant_files
 
 async def batch_relevance_check(files, task_description):
@@ -206,6 +214,7 @@ For each file, respond with a JSON array of objects containing:
                 # Unknown content type, fallback to medium relevance
                 file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
         except (json.JSONDecodeError, ValueError, AttributeError) as e:
+            logging.error(f"Error processing response: {str(e)}")
             console.print(f"[red]Error processing response: {str(e)}[/red]")
             # Fallback to medium relevance if parsing fails
             file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
@@ -221,7 +230,7 @@ async def generate_task_plan(task_description, codebase_summary):
     print("Results:", json.dumps(relevance_results, indent=2))
     
     # Filter for high relevance files
-    filtered_results = [r for r in relevance_results if r.get('relevance') == 'high']
+    filtered_results = [r for r in relevance_results if isinstance(r, dict) and r.get('relevance') == 'high']
     
     # Combine file information with relevance results
     enhanced_summary = []
@@ -300,38 +309,221 @@ async def validate_ai_response(response: str):
     )
     return corrected_response.content
 
-def format_explanation(explanation: str) -> Panel:
-    """Format the explanation section in a panel."""
-    return Panel(explanation, title="Task Explanation", border_style="blue")
-
-def format_files_modified(files: list) -> Table:
-    """Format the files modified section as a table."""
-    table = Table(title="Files to be Modified", show_header=True, header_style="bold magenta")
-    table.add_column("File Path", style="cyan")
-    table.add_column("Status", style="green")
+async def fix_json_plan(raw_plan: str, error_details: str = None) -> str:
+    """
+    Attempt to fix invalid JSON plan by asking the AI for a correction.
     
-    for file in files:
-        if isinstance(file, str):
-            table.add_row(file, "To be modified")
-        elif isinstance(file, dict):
-            table.add_row(file.get('path', 'Unknown'), file.get('status', 'To be modified'))
+    Args:
+        raw_plan: The invalid JSON string that needs fixing
+        error_details: Optional error message explaining why the JSON was invalid
+    
+    Returns:
+        str: A valid JSON string containing the required keys
+    """
+    error_context = f" Error: {error_details}" if error_details else ""
+    
+    message = {
+        "role": "user",
+        "content": f"""The following plan data failed JSON parsing.{error_context}
+        Please fix and return a valid JSON object containing 'explanation', 'files_modified', and 'codebase_analysis' keys.
+        
+        Raw content:
+        {raw_plan}"""
+    }
+    
+    try:
+        response = await client.messages.create(
+            max_tokens=1024,
+            messages=[message],
+            model="claude-3-5-sonnet-latest"
+        )
+        
+        # Extract JSON from response
+        content = response.content[0].text
+        json_start = content.find('{')
+        json_end = content.rfind('}') + 1
+        
+        if json_start != -1 and json_end != -1:
+            json_str = content[json_start:json_end]
+            # Validate the fixed JSON has required keys
+            fixed_json = json.loads(json_str)
+            if all(key in fixed_json for key in ["explanation", "files_modified", "codebase_analysis"]):
+                return json.dumps(fixed_json, indent=2)
+        
+        logging.error("AI response did not contain valid JSON with required keys")
+        return None
+    except Exception as e:
+        logging.error(f"Error fixing JSON plan: {str(e)}")
+        return None
+
+def format_current_implementation(implementation: dict) -> Panel:
+    """Format the current implementation section in a panel."""
+    if not implementation:
+        return Panel("No current implementation details available",
+                    title="Current Implementation",
+                    border_style="blue")
+    
+    try:
+        # Handle both string and dictionary values
+        content_lines = []
+        for key, value in implementation.items():
+            if isinstance(value, dict):
+                # Format nested dictionary
+                nested_content = "\n  ".join(f"{k}: {v}" for k, v in value.items())
+                content_lines.append(f"{key}:\n  {nested_content}")
+            else:
+                content_lines.append(f"{key}: {value}")
+        
+        content = "\n".join(content_lines)
+        return Panel(content, title="Current Implementation", border_style="blue")
+    except Exception as e:
+        return Panel(f"Error formatting implementation: {str(e)}",
+                    title="Current Implementation",
+                    border_style="red")
+
+async def correct_recommended_changes(raw_changes: dict) -> dict:
+    """
+    Request corrected format for recommended changes from AI.
+    
+    Args:
+        raw_changes: Dictionary containing the raw recommended changes
+        
+    Returns:
+        dict: Corrected changes dictionary with proper format
+    """
+    message = {
+        "role": "user",
+        "content": f"""The recommended changes did not adhere to the expected JSON format. 
+        Each change should be an object with keys 'location', 'suggestion', and 'benefit'.
+        Please provide a corrected JSON object.
+        
+        Raw data: {json.dumps(raw_changes)}"""
+    }
+    
+    try:
+        response = await client.messages.create(
+            max_tokens=1024,
+            messages=[message],
+            model="claude-3-5-sonnet-latest"
+        )
+        
+        content = response.content[0].text
+        json_start = content.find('{')
+        json_end = content.rfind('}') + 1
+        
+        if json_start != -1 and json_end != -1:
+            json_str = content[json_start:json_end]
+            corrected = json.loads(json_str)
+            
+            # Verify the corrected format
+            if isinstance(corrected, dict) and all(
+                isinstance(change, dict) and 
+                all(key in change for key in ['location', 'suggestion', 'benefit'])
+                for change in corrected.values()
+            ):
+                return corrected
+                
+        logging.warning("AI response did not contain properly formatted changes")
+        return raw_changes
+    except Exception as e:
+        logging.error(f"Error correcting recommended changes: {str(e)}")
+        return raw_changes
+
+async def format_recommended_changes(changes: dict) -> Table:
+    """Format the recommended changes section as a table."""
+    table = Table(title="Recommended Changes", show_header=True, header_style="bold magenta")
+    table.add_column("Location", style="cyan")
+    table.add_column("Suggestion", style="green")
+    table.add_column("Benefit", style="yellow")
+    
+    if not changes:
+        table.add_row("No changes", "No suggestions", "N/A")
+        return table
+    
+    # Verify format and correct if needed
+    needs_correction = False
+    for key, change in changes.items():
+        if not isinstance(change, dict) or not all(
+            key in change for key in ['location', 'suggestion', 'benefit']
+        ):
+            needs_correction = True
+            break
+    
+    if needs_correction:
+        changes = await correct_recommended_changes(changes)
+    
+    # Add rows to table
+    for key, change in changes.items():
+        if isinstance(change, dict):
+            location = change.get('location', 'Unknown location')
+            suggestion = change.get('suggestion', 'No suggestion provided')
+            benefit = change.get('benefit', 'No benefit specified')
+            table.add_row(location, suggestion, benefit)
+        else:
+            # Handle case where change is still not a dictionary after correction
+            table.add_row(str(key), str(change), "N/A")
     
     return table
 
-def format_codebase_analysis(analysis: str) -> Panel:
-    """Format the codebase analysis section with syntax highlighting."""
-    if isinstance(analysis, dict):
-        analysis = json.dumps(analysis, indent=2)
+async def display_json_data(json_data: dict):
+    """Display the JSON data with rich formatting."""
+    console.clear()
+    console.print("\n[bold cyan]JSON Data Summary[/bold cyan]", justify="center")
+    console.print("=" * 80, justify="center")
     
-    syntax = Syntax(analysis, "json", theme="monokai", word_wrap=True)
-    return Panel(syntax, title="Codebase Analysis", border_style="green")
+    # Display current implementation if available
+    if current_impl := json_data.get('current_implementation'):
+        console.print(format_current_implementation(current_impl))
+        console.print()
+    
+    # Display files to be modified if available
+    if files_modified := json_data.get('files_modified'):
+        files_table = Table(title="Files to be Modified", show_header=True, header_style="bold magenta")
+        files_table.add_column("File Path", style="cyan")
+        files_table.add_column("Description", style="green")
+        
+        if isinstance(files_modified, list):
+            for file in files_modified:
+                if isinstance(file, str):
+                    files_table.add_row(file, "")
+                elif isinstance(file, dict):
+                    files_table.add_row(
+                        file.get('path', 'Unknown'),
+                        file.get('description', 'No description provided')
+                    )
+        console.print(files_table)
+        console.print()
+    
+    # Display recommended changes if available
+    if recommended_changes := json_data.get('recommended_changes'):
+        if isinstance(recommended_changes, dict) and recommended_changes:
+            changes_table = await format_recommended_changes(recommended_changes)
+            console.print(changes_table)
+            console.print()
+    
+    console.print("\n[bold green]Please review the formatted JSON data.[/bold green]")
+
 
 async def display_final_plan(plan: str):
     """Display the final plan with rich formatting."""
     try:
         with Status("[bold blue]Formatting task plan...", console=console):
             # Parse the plan JSON
-            plan_data = json.loads(plan) if isinstance(plan, str) else plan
+            
+            #this needs to convert the list its in to a dictionary
+            if isinstance(plan, list):
+                if isinstance(plan[0], TextBlock):
+                    plan_data = json.loads(plan[0].text)
+                elif isinstance(plan[0], dict):
+                    plan_data = plan[0]  # Directly use the dictionary if it's already parsed
+                else:
+                    plan_data = json.loads(plan[0])
+            elif isinstance(plan, str):
+                plan_data = json.loads(plan)
+            elif isinstance(plan, dict):
+                plan_data = plan  # Directly use the dictionary if it's already parsed
+            else:
+                raise TypeError("Plan must be a string, a list containing a string, or a dictionary.")
             
             # Clear the screen for better presentation
             console.clear()
@@ -341,23 +533,53 @@ async def display_final_plan(plan: str):
             console.print("=" * 80, justify="center")
             
             # Display each section
-            console.print(format_explanation(plan_data.get('explanation', 'No explanation provided')))
-            console.print()
-            
-            console.print(format_files_modified(plan_data.get('files_modified', [])))
-            console.print()
-            
-            console.print(format_codebase_analysis(plan_data.get('codebase_analysis', '{}')))
+            if isinstance(plan_data, dict):
+                console.print(Panel(plan_data.get('explanation', 'No explanation provided'), title="Task Explanation", border_style="blue"))
+                console.print()
+                
+                console.print(Table(title="Files to be Modified", show_header=True, header_style="bold magenta"))
+                console.print()
+                
+                codebase_analysis = plan_data.get('codebase_analysis', '{}')
+                if isinstance(codebase_analysis, dict):
+                    codebase_analysis = json.dumps(codebase_analysis, indent=2)
+                console.print(Syntax(codebase_analysis, "json", theme="native", word_wrap=True, background_color=None))
+            else:
+                logging.error("plan_data is not a dictionary")
             
             console.print("\n[bold green]Please review the plan and proceed with the necessary actions.[/bold green]")
     
-    except json.JSONDecodeError:
-        console.print(Panel(
-            "[red]Error: Invalid plan format[/red]\n\nRaw plan content:\n" + str(plan),
-            title="Error",
-            border_style="red"
-        ))
+    except json.JSONDecodeError as e:
+        # Attempt to fix invalid JSON using AI
+        logging.warning(f"Invalid JSON plan detected: {str(e)}")
+        console.print("[yellow]Attempting to fix invalid JSON plan...[/yellow]")
+        
+        fixed_plan = await fix_json_plan(str(plan), str(e))
+        if fixed_plan:
+            # Retry displaying with fixed plan
+            plan_data = json.loads(fixed_plan)
+            console.print("[green]Successfully fixed and parsed JSON plan[/green]")
+            
+            console.print(Panel(plan_data.get('explanation', 'No explanation provided'), title="Task Explanation", border_style="blue"))
+            console.print()
+            console.print(Table(title="Files to be Modified", show_header=True, header_style="bold magenta"))
+            console.print()
+            codebase_analysis = plan_data.get('codebase_analysis', '{}')
+            if isinstance(codebase_analysis, dict):
+                codebase_analysis = json.dumps(codebase_analysis, indent=2)
+            console.print(Syntax(codebase_analysis, "json", theme="native", word_wrap=True, background_color=None))
+        else:
+            # Fallback to error display if fix failed
+            logging.error("Failed to fix invalid JSON plan")
+            console.print(Panel(
+                "[red]Error: Invalid plan format and automatic fix failed[/red]\n\nRaw plan content:\n" + str(plan),
+                title="Error",
+                border_style="red"
+            ))
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        logging.error(f"Unexpected error in display_final_plan: {str(e)}\nTraceback:\n{tb}")
         console.print(Panel(
             f"[red]An unexpected error occurred:[/red]\n{str(e)}",
             title="Error",
