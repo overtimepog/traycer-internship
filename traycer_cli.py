@@ -110,7 +110,9 @@ async def explore_codebase(root_dir='.'):
                     process_file(file_path, code_extensions, text_extensions, semaphore)
                 ))
             else:
-                print(f"Using cached data for {file_path}")
+                tasks.append(asyncio.create_task(
+                    asyncio.sleep(0, result=file_cache[file_path])
+                ))
     
     # Run all file processing tasks concurrently.
     codebase_summary = await asyncio.gather(*tasks)
@@ -131,14 +133,14 @@ async def ai_based_relevance(file_summary, task_description):
 Snippet:
 {file_summary.get('content', '')[:200]}  # Limit to first 200 characters
 
-Please determine the relevance of this file to the task. Respond with one of "high", "medium", or "low"."""
+Please determine the relevance of this file to the task. Respond with one of "high", "medium", or "low".""" 
     }
     response = await client.messages.create(
         max_tokens=50,
         messages=[message],
         model="claude-3-5-sonnet-latest"
     )
-    relevance = response.content[0].text.strip().lower()
+    relevance = response.content
     return 'medium' if relevance not in ['high', 'low'] else relevance
 
 async def generate_task_plan(task_description, codebase_summary):
@@ -171,7 +173,7 @@ Codebase Analysis:
 - Moderately Relevant Files: {[f['path'] for f in formatted_summary if f['relevance'] == 'medium']}
 
 Detailed File Information:
-{formatted_summary}
+{json.dumps(formatted_summary, indent=2)}
 
 Please provide a JSON response with the keys:
 - explanation (a string)
@@ -185,7 +187,7 @@ Ensure the response is valid JSON."""
         messages=[message],
         model="claude-3-5-sonnet-latest"
     )
-    return response.content[0].text
+    return response.content
 
 async def validate_ai_response(response: str):
     """
@@ -193,10 +195,10 @@ async def validate_ai_response(response: str):
     Ensures the response properly utilizes the codebase context and includes required sections.
     """
     try:
-        response_json = json.loads(response)
+        response_json = json.loads(response[0].text)
         if all(key in response_json for key in ["explanation", "files_modified", "codebase_analysis"]):
-            return response
-    except json.JSONDecodeError:
+            return response[0].text
+    except (json.JSONDecodeError, TypeError):
         pass
 
     correction_message = {
@@ -213,7 +215,7 @@ Please provide a complete JSON response with the keys:
         messages=[correction_message],
         model="claude-3-5-sonnet-latest"
     )
-    return corrected_response.content[0].text
+    return corrected_response[0].text
 
 async def display_final_plan(plan: str):
     """Function to display the final verified plan to the user"""
