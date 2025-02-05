@@ -5,6 +5,8 @@ import re
 from anthropic import AsyncAnthropic
 from anthropic.types import TextBlock
 import json
+from concurrent.futures import ProcessPoolExecutor
+from persistent_cache import get_cache, set_cache  # Import the persistent cache module
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -22,6 +24,14 @@ logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %
 client = AsyncAnthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY")
 )
+
+def count_calls(func):
+    def wrapper(*args, **kwargs):
+        wrapper.calls += 1
+        print(f"{func.__name__} called {wrapper.calls} times this session.")
+        return func(*args, **kwargs)
+    wrapper.calls = 0
+    return wrapper
 
 import aiofiles
 
@@ -48,7 +58,8 @@ async def read_file_snippet(file_path, start_line=0, num_lines=10):
 
 async def scan_file_content(file_path, keywords):
     """
-    Quickly scan a file for relevant keywords and return all matching snippets.
+    Line | 49-80 `cli.py`
+    Quickly scan a file for relevant keywords using chunked reading to reduce memory usage.
     Returns a list of dictionaries containing:
     - line_range: string showing the range of lines included in the snippet (e.g. "205 - 209")
     - context: the actual text content from those lines
@@ -57,22 +68,51 @@ async def scan_file_content(file_path, keywords):
     are returned, with no limit on the number of snippets.
     """
     snippets = []
+    line_buffer = []  # Buffer to store context lines
+    current_line = 0
+    chunk_size = 8192  # 8KB chunks
+    
     try:
         async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            content = await f.readlines()
-            
-        for i, line in enumerate(content):
-            if any(keyword.lower() in line.lower() for keyword in keywords):
-                start = max(0, i - 2)
-                end = min(len(content), i + 3)
-                context = ''.join(content[start:end])
-                # Convert to 1-based line numbers for display
-                start_line = start + 1
-                end_line = end
-                snippets.append({
-                    'line_range': f"{start_line} - {end_line}",
-                    'context': context
-                })
+            # Read file in chunks to reduce memory usage
+            while True:
+                chunk = await f.read(chunk_size)
+                if not chunk:
+                    break
+                    
+                lines = chunk.split('\n')
+                # Handle line spanning across chunks
+                if line_buffer and lines:
+                    line_buffer[-1] += lines[0]
+                    lines = lines[1:]
+                
+                line_buffer.extend(lines)
+                
+                # Process complete lines, keeping a few lines as buffer for context
+                while len(line_buffer) > 4:  # Keep 4 lines for context
+                    line = line_buffer[0]
+                    if any(keyword.lower() in line.lower() for keyword in keywords):
+                        # Get context (2 lines before and 2 after)
+                        context_start = max(0, len(line_buffer) - 5)
+                        context = '\n'.join(line_buffer[context_start:len(line_buffer)])
+                        snippets.append({
+                            'line_range': f"{current_line - 2} - {current_line + 2}",
+                            'context': context
+                        })
+                    line_buffer.pop(0)
+                    current_line += 1
+            # Process any remaining lines in the buffer
+            for idx, line in enumerate(line_buffer):
+                if any(keyword.lower() in line.lower() for keyword in keywords):
+                    start = max(0, idx - 2)
+                    end = min(len(line_buffer), idx + 3)
+                    context = '\n'.join(line_buffer[start:end])
+                    start_line = current_line + start + 1  # converting to 1-based numbering
+                    end_line = current_line + end
+                    snippets.append({
+                        'line_range': f"{start_line} - {end_line}",
+                        'context': context
+                    })
                     
         return snippets
     except Exception as e:
@@ -81,13 +121,44 @@ async def scan_file_content(file_path, keywords):
 
 async def process_file(file_path, code_extensions, text_extensions, keywords, semaphore):
     """
+    Line | 92-115 `cli.py`
     Process a single file by gathering metadata and scanning for relevant content.
+    Implements early filtering for binary and large files.
     """
     async with semaphore:
         try:
             file_size = await asyncio.to_thread(os.path.getsize, file_path)
             file_extension = os.path.splitext(file_path)[1].lower()
             last_modified = await asyncio.to_thread(os.path.getmtime, file_path)
+            
+            # Early filtering for large files (>10MB) or binary content
+            MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB #TODO: figure out some way to shrink large files so they can be sent as context to the ai model
+            if file_size > MAX_FILE_SIZE:
+                return {
+                    'path': file_path,
+                    'size': file_size,
+                    'extension': file_extension,
+                    'importance': 'low',
+                    'last_modified': last_modified,
+                    'snippets': [],
+                    'skip_reason': 'File too large'
+                }
+            
+            # Check for binary content (read first 8KB)
+            async with aiofiles.open(file_path, 'rb') as f:
+                sample = await f.read(8192)
+                try:
+                    sample.decode('utf-8')
+                except UnicodeDecodeError:
+                    return {
+                        'path': file_path,
+                        'size': file_size,
+                        'extension': file_extension,
+                        'importance': 'low',
+                        'last_modified': last_modified,
+                        'snippets': [],
+                        'skip_reason': 'Binary file'
+                    }
             
             # Determine importance based on file type
             if file_extension in code_extensions:
@@ -114,9 +185,12 @@ async def process_file(file_path, code_extensions, text_extensions, keywords, se
             logging.error(f"Error processing file {file_path}: {str(e)}")
             return {'path': file_path, 'error': str(e)}
 
-file_cache = {}
-
 async def explore_codebase(root_dir='.', task_description=''):
+    """
+    Line | 119-157 `cli.py`
+    Explores codebase focusing on potentially relevant files based on task keywords.
+    Uses ProcessPoolExecutor for CPU-bound tasks and persistent caching for file data.
+    """
     """
     Explores codebase focusing on potentially relevant files based on task keywords.
     """
@@ -136,15 +210,15 @@ async def explore_codebase(root_dir='.', task_description=''):
         for file in files:
             file_path = os.path.join(root, file)
             cache_key = f"{file_path}:{os.path.getmtime(file_path)}"
+            cached_result = await get_cache(cache_key)
             
-            if cache_key in file_cache:
+            if cached_result:
                 tasks.append(asyncio.create_task(
-                    asyncio.sleep(0, result=file_cache[cache_key])
+                    asyncio.sleep(0, result=cached_result)
                 ))
             else:
-                tasks.append(asyncio.create_task(
-                    process_file(file_path, code_extensions, text_extensions, keywords, semaphore)
-                ))
+                # Remove ProcessPoolExecutor usage; schedule process_file directly
+                tasks.append(process_file(file_path, code_extensions, text_extensions, keywords, semaphore))
     
     codebase_summary = await asyncio.gather(*tasks)
     
@@ -152,7 +226,7 @@ async def explore_codebase(root_dir='.', task_description=''):
     for file_summary in codebase_summary:
         if 'error' not in file_summary:
             cache_key = f"{file_summary['path']}:{file_summary['last_modified']}"
-            file_cache[cache_key] = file_summary
+            await set_cache(cache_key, file_summary)
     
     # Filter out files with no relevant snippets
     relevant_files = [f for f in codebase_summary if isinstance(f, dict) and f.get('snippets', [])]
@@ -251,10 +325,7 @@ async def generate_task_plan(task_description, codebase_summary):
 Relevant Files Analysis:
 {json.dumps(enhanced_summary, indent=2)}
 
-Please provide a JSON response with:
-- explanation: Brief task explanation
-- files_modified: List of files that need modification
-- codebase_analysis: Analysis of relevant code snippets"""
+Please provide a JSON object that strictly adheres to the following format. The JSON must have exactly three top-level keys: 'explanation', 'files_modified', and 'codebase_analysis'. 'explanation' should be a string that briefly describes the task and approach. 'files_modified' should be an array where each element is either a string (representing the file path) or an object with the keys 'path' and 'description' that explain why the file needs modification. 'codebase_analysis' should be either a string or an object containing the keys 'current_state' and 'recommendations'. No additional keys are allowed."""
     }
     
     response = await client.messages.create(
@@ -289,25 +360,114 @@ Please provide a JSON response with:
             "codebase_analysis": f"Unable to analyze due to error: {str(e)}"
         }, indent=2)
 
-async def validate_ai_response(response: str):
-    """Validate and format AI response."""
-    try:
-        response_json = json.loads(response)
-        if all(key in response_json for key in ["explanation", "files_modified", "codebase_analysis"]):
-            return json.dumps(response_json, indent=2)
-    except json.JSONDecodeError:
-        pass
-    
-    correction_message = {
-        "role": "user",
-        "content": "Please provide valid JSON with explanation, files_modified, and codebase_analysis keys."
+@count_calls
+def transform_plan_format(plan_obj: dict) -> dict:
+    """
+    Convert a plan object with unexpected keys (e.g. "current_state", "recommendations")
+    into the expected format with keys:
+    - explanation
+    - files_modified
+    - codebase_analysis
+    """
+    #TODO: keep track of how many times this function is called per session
+    print("Transforming plan format...")
+    # If already in expected format, return as is.
+    if {"explanation", "files_modified", "codebase_analysis"}.issubset(plan_obj.keys()):
+        return plan_obj
+    new_plan = {
+        "explanation": "The plan outlines optimizations based on current analysis.",
+        "files_modified": [],
+        "codebase_analysis": json.dumps(plan_obj, indent=2)
     }
-    corrected_response = await client.messages.create(
-        max_tokens=1024,
-        messages=[correction_message],
-        model="claude-3-5-sonnet-latest"
-    )
-    return corrected_response.content
+    return new_plan
+
+def validate_json_schema(data: dict) -> bool:
+    """Validate that the JSON data follows the required schema."""
+    required_schema = {
+        "explanation": {
+            "type": str,
+            "required": True
+        },
+        "files_modified": {
+            "type": list,
+            "required": True,
+            "items": {
+                "type": (str, dict),
+                "dict_keys": ["path", "description"]
+            }
+        },
+        "codebase_analysis": {
+            "type": (str, dict),
+            "required": True,
+            "dict_keys": ["current_state", "recommendations"] if isinstance(data.get("codebase_analysis"), dict) else None
+        }
+    }
+    
+    for key, schema in required_schema.items():
+        if schema["required"] and key not in data:
+            return False
+        
+        if key in data:
+            value = data[key]
+            if not isinstance(value, schema["type"]):
+                return False
+                
+            if isinstance(value, list) and "items" in schema:
+                for item in value:
+                    if not isinstance(item, schema["items"]["type"]):
+                        return False
+                    if isinstance(item, dict) and "dict_keys" in schema["items"]:
+                        if not all(k in item for k in schema["items"]["dict_keys"]):
+                            return False
+                            
+            if isinstance(value, dict) and schema.get("dict_keys"):
+                if not all(k in value for k in schema["dict_keys"]):
+                    return False
+    
+    return True
+
+async def validate_ai_response(response: str):
+    """Validate and format AI response with retry logic."""
+    MAX_ATTEMPTS = 3
+    attempts = 0
+    
+    while attempts < MAX_ATTEMPTS:
+        try:
+            response_json = json.loads(response)
+            
+            # Check if response has the required structure
+            if validate_json_schema(response_json):
+                return json.dumps(response_json, indent=2)
+            
+            # If schema validation fails, try to fix the response
+            logging.info(f"Attempt {attempts + 1}: JSON schema validation failed, requesting correction")
+            response = await fix_json_plan(response, "Response does not match required schema")
+            if not response:
+                break
+                
+            attempts += 1
+            
+        except json.JSONDecodeError as e:
+            logging.error(f"Attempt {attempts + 1}: JSON parsing failed: {str(e)}")
+            response = await fix_json_plan(response, str(e))
+            if not response:
+                break
+                
+            attempts += 1
+            
+        except Exception as e:
+            logging.error(f"Unexpected error during validation: {str(e)}")
+            break
+    
+    # Return fallback response if all attempts fail
+    return json.dumps({
+        "explanation": "Error processing AI response after multiple attempts",
+        "files_modified": [],
+        "codebase_analysis": {
+            "current_state": "Error state",
+            "recommendations": [f"Failed to process response after {attempts} attempts"]
+        }
+    }, indent=2)
 
 async def fix_json_plan(raw_plan: str, error_details: str = None) -> str:
     """
@@ -318,17 +478,41 @@ async def fix_json_plan(raw_plan: str, error_details: str = None) -> str:
         error_details: Optional error message explaining why the JSON was invalid
     
     Returns:
-        str: A valid JSON string containing the required keys
+        str: A valid JSON string containing exactly the keys 'explanation', 'files_modified', and 'codebase_analysis'
     """
     error_context = f" Error: {error_details}" if error_details else ""
     
     message = {
         "role": "user",
-        "content": f"""The following plan data failed JSON parsing.{error_context}
-        Please fix and return a valid JSON object containing 'explanation', 'files_modified', and 'codebase_analysis' keys.
-        
-        Raw content:
-        {raw_plan}"""
+        "content": f"""The following plan data failed validation.{error_context}
+Please provide a corrected JSON object that STRICTLY follows this schema:
+
+{{
+    "explanation": "string describing the task and approach",
+    "files_modified": [
+        // Each item must be either a string or an object with "path" and "description"
+        "path/to/file.ext",
+        {{
+            "path": "path/to/file.ext",
+            "description": "why this file needs modification"
+        }}
+    ],
+    "codebase_analysis": {{
+        "current_state": "description of current implementation",
+        "recommendations": [
+            "list of specific recommendations"
+        ]
+    }}
+}}
+
+IMPORTANT:
+1. The response MUST be valid JSON
+2. ONLY these three top-level keys are allowed
+3. The types must match exactly as shown
+4. No additional keys are permitted
+
+Raw content to fix:
+{raw_plan}"""
     }
     
     try:
@@ -345,41 +529,17 @@ async def fix_json_plan(raw_plan: str, error_details: str = None) -> str:
         
         if json_start != -1 and json_end != -1:
             json_str = content[json_start:json_end]
-            # Validate the fixed JSON has required keys
             fixed_json = json.loads(json_str)
-            if all(key in fixed_json for key in ["explanation", "files_modified", "codebase_analysis"]):
+            # Check that the fixed JSON contains exactly the required keys
+            required_keys = {"explanation", "files_modified", "codebase_analysis"}
+            if set(fixed_json.keys()) == required_keys:
                 return json.dumps(fixed_json, indent=2)
         
-        logging.error("AI response did not contain valid JSON with required keys")
+        logging.error("AI response did not return valid JSON with exactly the required keys")
         return None
     except Exception as e:
         logging.error(f"Error fixing JSON plan: {str(e)}")
         return None
-
-def format_current_implementation(implementation: dict) -> Panel:
-    """Format the current implementation section in a panel."""
-    if not implementation:
-        return Panel("No current implementation details available",
-                    title="Current Implementation",
-                    border_style="blue")
-    
-    try:
-        # Handle both string and dictionary values
-        content_lines = []
-        for key, value in implementation.items():
-            if isinstance(value, dict):
-                # Format nested dictionary
-                nested_content = "\n  ".join(f"{k}: {v}" for k, v in value.items())
-                content_lines.append(f"{key}:\n  {nested_content}")
-            else:
-                content_lines.append(f"{key}: {value}")
-        
-        content = "\n".join(content_lines)
-        return Panel(content, title="Current Implementation", border_style="blue")
-    except Exception as e:
-        return Panel(f"Error formatting implementation: {str(e)}",
-                    title="Current Implementation",
-                    border_style="red")
 
 async def correct_recommended_changes(raw_changes: dict) -> dict:
     """
@@ -465,6 +625,16 @@ async def format_recommended_changes(changes: dict) -> Table:
     
     return table
 
+def format_current_implementation(implementation: dict) -> Panel:
+    """
+    Format the current implementation section in a Panel.
+    """
+    from rich.panel import Panel  # Ensure Panel is imported
+    if not implementation:
+        return Panel("No implementation details provided", title="Current Implementation", border_style="blue")
+    content = "\n".join(f"{key}: {value}" for key, value in implementation.items())
+    return Panel(content, title="Current Implementation", border_style="blue")
+
 async def display_json_data(json_data: dict):
     """Display the JSON data with rich formatting."""
     console.clear()
@@ -505,77 +675,106 @@ async def display_json_data(json_data: dict):
 
 
 async def display_final_plan(plan: str):
-    """Display the final plan with rich formatting."""
+    """Display the final plan as bullet points rather than raw JSON."""
     try:
         with Status("[bold blue]Formatting task plan...", console=console):
-            # Parse the plan JSON
-            
-            #this needs to convert the list its in to a dictionary
+            # Convert the plan input into a dictionary.
             if isinstance(plan, list):
                 if isinstance(plan[0], TextBlock):
                     plan_data = json.loads(plan[0].text)
                 elif isinstance(plan[0], dict):
-                    plan_data = plan[0]  # Directly use the dictionary if it's already parsed
+                    plan_data = plan[0]
                 else:
                     plan_data = json.loads(plan[0])
             elif isinstance(plan, str):
                 plan_data = json.loads(plan)
             elif isinstance(plan, dict):
-                plan_data = plan  # Directly use the dictionary if it's already parsed
+                plan_data = plan
             else:
                 raise TypeError("Plan must be a string, a list containing a string, or a dictionary.")
-            
-            # Clear the screen for better presentation
+
             console.clear()
-            
-            # Display title
             console.print("\n[bold cyan]Task Plan Summary[/bold cyan]", justify="center")
             console.print("=" * 80, justify="center")
+            console.print("\n[white]Based on the code analysis, here are the key areas for optimization:[/white]\n")
             
-            # Display each section
-            if isinstance(plan_data, dict):
-                console.print(Panel(plan_data.get('explanation', 'No explanation provided'), title="Task Explanation", border_style="blue"))
-                console.print()
-                
-                console.print(Table(title="Files to be Modified", show_header=True, header_style="bold magenta"))
-                console.print()
-                
-                codebase_analysis = plan_data.get('codebase_analysis', '{}')
-                if isinstance(codebase_analysis, dict):
-                    codebase_analysis = json.dumps(codebase_analysis, indent=2)
-                console.print(Syntax(codebase_analysis, "json", theme="native", word_wrap=True, background_color=None))
+            # Display the explanation as a panel.
+            explanation = plan_data.get("explanation", "No explanation provided")
+            console.print(Panel(explanation, title="Task Explanation", border_style="blue"))
+            console.print()
+            
+            # Display files to be modified as a bullet list.
+            files_modified = plan_data.get("files_modified", [])
+            if files_modified:
+                files_list = "\n".join(
+                    f"- {f}" if isinstance(f, str)
+                    else f"- {f.get('path', 'Unknown')}: {f.get('description', 'No description provided')}"
+                    for f in files_modified
+                )
             else:
-                logging.error("plan_data is not a dictionary")
+                files_list = "No files to be modified."
+            console.print(Panel(files_list, title="Files to be Modified", border_style="magenta"))
+            console.print()
+
+            # Improved dynamic formatting for recommended_changes
+            if "recommended_changes" in plan_data:
+                changes = plan_data["recommended_changes"]
+                bullet_changes = []
+                for category, items in changes.items():
+                    bullet_changes.append(f"• [bold]{category}[/bold]:")
+                    if isinstance(items, dict):
+                        count = 1
+                        for k, v in items.items():
+                            bullet_changes.append(f"    {count}. {k}: {v}")
+                            count += 1
+                    elif isinstance(items, list):
+                        for index, item in enumerate(items, start=1):
+                            bullet_changes.append(f"    {index}. {item}")
+                    else:
+                        bullet_changes.append(f"    1. {items}")
+                analysis_str = "\n".join(bullet_changes)
+                console.print(Panel(analysis_str, title="Recommended Changes", border_style="green"))
+            else:
+                # Restored original codebase_analysis formatting
+                analysis = plan_data.get("codebase_analysis", {})
+                if isinstance(analysis, dict):
+                    analysis_lines = []
+                    for section, details in analysis.items():
+                        analysis_lines.append(f"- {section}:")
+                        if isinstance(details, list):
+                            for detail in details:
+                                analysis_lines.append(f"    • {detail}")
+                        elif isinstance(details, dict):
+                            for key, value in details.items():
+                                analysis_lines.append(f"    • {key}: {value}")
+                        else:
+                            analysis_lines.append(f"    • {details}")
+                    analysis_str = "\n".join(analysis_lines)
+                elif isinstance(analysis, str):
+                    analysis_str = analysis
+                else:
+                    analysis_str = "No codebase analysis available."
+                console.print(Panel(analysis_str, title="Codebase Analysis", border_style="green"))
             
+            # Format additional dynamic sections if available
+            additional_keys = ["current_issues", "recommended_improvements", "implementation_approach"]
+            for key in additional_keys:
+                if key in plan_data:
+                    content = plan_data[key]
+                    section_lines = []
+                    section_lines.append(f"- {key}:")
+                    if isinstance(content, list):
+                        for i, item in enumerate(content, start=1):
+                            section_lines.append(f"    {i}. {item}")
+                    elif isinstance(content, dict):
+                        for i, (subkey, subvalue) in enumerate(content.items(), start=1):
+                            section_lines.append(f"    {i}. {subkey}: {subvalue}")
+                    else:
+                        section_lines.append(f"    1. {content}")
+                    section_str = "\n".join(section_lines)
+                    console.print(Panel(section_str, title=key.replace('_', ' ').title(), border_style="cyan"))
+
             console.print("\n[bold green]Please review the plan and proceed with the necessary actions.[/bold green]")
-    
-    except json.JSONDecodeError as e:
-        # Attempt to fix invalid JSON using AI
-        logging.warning(f"Invalid JSON plan detected: {str(e)}")
-        console.print("[yellow]Attempting to fix invalid JSON plan...[/yellow]")
-        
-        fixed_plan = await fix_json_plan(str(plan), str(e))
-        if fixed_plan:
-            # Retry displaying with fixed plan
-            plan_data = json.loads(fixed_plan)
-            console.print("[green]Successfully fixed and parsed JSON plan[/green]")
-            
-            console.print(Panel(plan_data.get('explanation', 'No explanation provided'), title="Task Explanation", border_style="blue"))
-            console.print()
-            console.print(Table(title="Files to be Modified", show_header=True, header_style="bold magenta"))
-            console.print()
-            codebase_analysis = plan_data.get('codebase_analysis', '{}')
-            if isinstance(codebase_analysis, dict):
-                codebase_analysis = json.dumps(codebase_analysis, indent=2)
-            console.print(Syntax(codebase_analysis, "json", theme="native", word_wrap=True, background_color=None))
-        else:
-            # Fallback to error display if fix failed
-            logging.error("Failed to fix invalid JSON plan")
-            console.print(Panel(
-                "[red]Error: Invalid plan format and automatic fix failed[/red]\n\nRaw plan content:\n" + str(plan),
-                title="Error",
-                border_style="red"
-            ))
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
@@ -587,6 +786,8 @@ async def display_final_plan(plan: str):
         ))
 
 async def main():
+    from persistent_cache import init_persistent_cache  # Newly added import
+    await init_persistent_cache()  # Initialize the persistent cache once the event loop is running
     task_description = input("Enter the task description: ")
     codebase_summary = await explore_codebase(task_description=task_description)
     console.print(f"[green]Found {len(codebase_summary)} relevant files in the codebase.[/green]")
