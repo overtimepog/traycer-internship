@@ -920,6 +920,8 @@ async def main():
     valid_plan = await validate_ai_response(plan)
     await display_final_plan(valid_plan)
     print_anthropic_cost()
+    # Add a prompt to keep the console window open in the executable
+    input("Press Enter to exit...")
 
 if __name__ == "__main__":
     asyncio.run(main())
