@@ -14,6 +14,13 @@ from rich.status import Status
 from pygments.styles.monokai import MonokaiStyle
 from rich.syntax import Syntax, SyntaxTheme
 from rich.style import Style
+from codebase import (
+    explore_codebase,
+    read_file_content,
+    read_file_snippet,
+    scan_file_content,
+    process_file
+)
 
 # Initialize rich console
 console = Console()
@@ -21,9 +28,35 @@ console = Console()
 # Configure logging
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 
-client = AsyncAnthropic(
-    api_key=os.environ.get("ANTHROPIC_API_KEY")
-)
+def get_api_key():
+    """Get the Anthropic API key from environment variables or .env file."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()  # Load environment variables from .env file
+        
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            console.print("[red]Error: ANTHROPIC_API_KEY not found in environment variables or .env file[/red]")
+            console.print("[yellow]Please set your Anthropic API key in a .env file or as an environment variable.[/yellow]")
+            console.print("You can create a .env file with the following content:")
+            console.print("[green]ANTHROPIC_API_KEY=your-api-key-here[/green]")
+            raise ValueError("Missing ANTHROPIC_API_KEY")
+        return api_key
+    except ImportError:
+        console.print("[yellow]python-dotenv not installed. Installing...[/yellow]")
+        import subprocess
+        subprocess.check_call(["pip", "install", "python-dotenv"])
+        from dotenv import load_dotenv
+        load_dotenv()
+        return get_api_key()
+
+try:
+    client = AsyncAnthropic(
+        api_key=get_api_key()
+    )
+except Exception as e:
+    console.print(f"[red]Failed to initialize Anthropic client: {str(e)}[/red]")
+    raise
 
 def count_calls(func):
     def wrapper(*args, **kwargs):
@@ -35,30 +68,76 @@ def count_calls(func):
 
 import aiofiles
 
-async def read_file_snippet(file_path, start_line=0, num_lines=10):
+async def process_file(file_path, code_extensions, text_extensions, keywords, semaphore, is_target_file=False):
     """
-    Asynchronously reads a snippet of lines from a file starting at a specific line.
+    Process a single file by gathering metadata and scanning for relevant content.
+    Implements early filtering for binary and large files.
     """
-    lines = []
-    try:
-        async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            # Skip to start_line
-            for _ in range(start_line):
-                await f.readline()
-            # Read requested lines
-            for _ in range(num_lines):
-                line = await f.readline()
-                if not line:
-                    break
-                lines.append(line.strip())
-    except Exception as e:
-        logging.error(f"Error reading file {file_path}: {str(e)}")
-        return f"Error reading file: {str(e)}"
-    return '\n'.join(lines)
+    async with semaphore:
+        try:
+            file_size = await asyncio.to_thread(os.path.getsize, file_path)
+            file_extension = os.path.splitext(file_path)[1].lower()
+            last_modified = await asyncio.to_thread(os.path.getmtime, file_path)
+            
+            # Early filtering for large files (>10MB) or binary content
+            MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+            # TODO: figure out some way to shrink large files so they can be sent as context to the ai model
+            if file_size > MAX_FILE_SIZE:
+                return {
+                    'path': file_path,
+                    'size': file_size,
+                    'extension': file_extension,
+                    'importance': 'high' if is_target_file else 'low',
+                    'last_modified': last_modified,
+                    'snippets': [],
+                    'skip_reason': 'File too large'
+                }
+            
+            # Check for binary content (read first 8KB)
+            async with aiofiles.open(file_path, 'rb') as f:
+                sample = await f.read(8192)
+                try:
+                    sample.decode('utf-8')
+                except UnicodeDecodeError:
+                    return {
+                        'path': file_path,
+                        'size': file_size,
+                        'extension': file_extension,
+                        'importance': 'high' if is_target_file else 'low',
+                        'last_modified': last_modified,
+                        'snippets': [],
+                        'skip_reason': 'Binary file'
+                    }
+            
+            # Determine importance based on file type and target status
+            if is_target_file:
+                importance = 'high'
+            elif file_extension in code_extensions:
+                importance = 'medium'
+            elif file_extension in text_extensions:
+                importance = 'low'
+            else:
+                importance = 'low'
+            
+            # Only scan content for potentially relevant files
+            snippets = []
+            if importance != 'low':
+                snippets = await scan_file_content(file_path, keywords)
+            
+            return {
+                'path': file_path,
+                'size': file_size,
+                'extension': file_extension,
+                'importance': importance,
+                'last_modified': last_modified,
+                'snippets': snippets
+            }
+        except Exception as e:
+            logging.error(f"Error processing file {file_path}: {str(e)}")
+            return {'path': file_path, 'error': str(e)}
 
 async def scan_file_content(file_path, keywords):
     """
-    Line | 49-80 `cli.py`
     Quickly scan a file for relevant keywords using chunked reading to reduce memory usage.
     Returns a list of dictionaries containing:
     - line_range: string showing the range of lines included in the snippet (e.g. "205 - 209")
@@ -119,119 +198,6 @@ async def scan_file_content(file_path, keywords):
         logging.error(f"Error scanning file {file_path}: {str(e)}")
         return []
 
-async def process_file(file_path, code_extensions, text_extensions, keywords, semaphore):
-    """
-    Line | 92-115 `cli.py`
-    Process a single file by gathering metadata and scanning for relevant content.
-    Implements early filtering for binary and large files.
-    """
-    async with semaphore:
-        try:
-            file_size = await asyncio.to_thread(os.path.getsize, file_path)
-            file_extension = os.path.splitext(file_path)[1].lower()
-            last_modified = await asyncio.to_thread(os.path.getmtime, file_path)
-            
-            # Early filtering for large files (>10MB) or binary content
-            MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB #TODO: figure out some way to shrink large files so they can be sent as context to the ai model
-            if file_size > MAX_FILE_SIZE:
-                return {
-                    'path': file_path,
-                    'size': file_size,
-                    'extension': file_extension,
-                    'importance': 'low',
-                    'last_modified': last_modified,
-                    'snippets': [],
-                    'skip_reason': 'File too large'
-                }
-            
-            # Check for binary content (read first 8KB)
-            async with aiofiles.open(file_path, 'rb') as f:
-                sample = await f.read(8192)
-                try:
-                    sample.decode('utf-8')
-                except UnicodeDecodeError:
-                    return {
-                        'path': file_path,
-                        'size': file_size,
-                        'extension': file_extension,
-                        'importance': 'low',
-                        'last_modified': last_modified,
-                        'snippets': [],
-                        'skip_reason': 'Binary file'
-                    }
-            
-            # Determine importance based on file type
-            if file_extension in code_extensions:
-                importance = 'high'
-            elif file_extension in text_extensions:
-                importance = 'medium'
-            else:
-                importance = 'low'
-            
-            # Only scan content for potentially relevant files
-            snippets = []
-            if importance != 'low':
-                snippets = await scan_file_content(file_path, keywords)
-            
-            return {
-                'path': file_path,
-                'size': file_size,
-                'extension': file_extension,
-                'importance': importance,
-                'last_modified': last_modified,
-                'snippets': snippets
-            }
-        except Exception as e:
-            logging.error(f"Error processing file {file_path}: {str(e)}")
-            return {'path': file_path, 'error': str(e)}
-
-async def explore_codebase(root_dir='.', task_description=''):
-    """
-    Line | 119-157 `cli.py`
-    Explores codebase focusing on potentially relevant files based on task keywords.
-    Uses ProcessPoolExecutor for CPU-bound tasks and persistent caching for file data.
-    """
-    """
-    Explores codebase focusing on potentially relevant files based on task keywords.
-    """
-    # Extract keywords from task description
-    keywords = set(re.findall(r'\b\w+\b', task_description.lower()))
-    keywords = {word for word in keywords if len(word) > 3}  # Filter out short words
-    
-    ignored_directories = {'.git', 'node_modules', '__pycache__', 'venv', '.pytest_cache'}
-    code_extensions = {'.py', '.js', '.ts', '.jsx', '.tsx'}
-    text_extensions = code_extensions.union({'.json', '.txt', '.md', '.html', '.css', '.xml', '.csv'})
-    
-    semaphore = asyncio.Semaphore(100)
-    tasks = []
-    
-    for root, dirs, files in os.walk(root_dir):
-        dirs[:] = [d for d in dirs if d not in ignored_directories]
-        for file in files:
-            file_path = os.path.join(root, file)
-            cache_key = f"{file_path}:{os.path.getmtime(file_path)}"
-            cached_result = await get_cache(cache_key)
-            
-            if cached_result:
-                tasks.append(asyncio.create_task(
-                    asyncio.sleep(0, result=cached_result)
-                ))
-            else:
-                # Remove ProcessPoolExecutor usage; schedule process_file directly
-                tasks.append(process_file(file_path, code_extensions, text_extensions, keywords, semaphore))
-    
-    codebase_summary = await asyncio.gather(*tasks)
-    
-    # Update cache with new results
-    for file_summary in codebase_summary:
-        if 'error' not in file_summary:
-            cache_key = f"{file_summary['path']}:{file_summary['last_modified']}"
-            await set_cache(cache_key, file_summary)
-    
-    # Filter out files with no relevant snippets
-    relevant_files = [f for f in codebase_summary if isinstance(f, dict) and f.get('snippets', [])]
-    return relevant_files
-
 async def batch_relevance_check(files, task_description):
     """
     Check relevance of multiple files in a single AI call to reduce API usage.
@@ -242,58 +208,143 @@ async def batch_relevance_check(files, task_description):
     file_summaries = []
     for i in range(0, len(files), 5):  # Process in batches of 5
         batch = files[i:i+5]
+        # Add full file content as a separate step to avoid f-string issues
+        batch_data = []
+        for f in batch:
+            full_content = await read_file_content(f['path'])
+            batch_data.append({
+                'path': f['path'],
+                'snippets': f['snippets'],
+                'full_content': full_content
+            })
+            
         message = {
             "role": "user",
             "content": f"""Task: {task_description}
 
 Files to analyze:
-{json.dumps([{
-    'path': f['path'],
-    'snippets': f['snippets']
-} for f in batch], indent=2)}
+{json.dumps(batch_data, indent=2)}
 
 For each file, respond with a JSON array of objects containing:
 - path: file path
 - relevance: "high", "medium", or "low"
+- needs_more_context: (optional) if you need more context, specify the line numbers or areas you'd like to see
 """
         }
         
         response = await client.messages.create(
-            max_tokens=1024,
+            max_tokens=4096,  # Increased token limit for larger responses
             messages=[message],
             model="claude-3-5-sonnet-latest"
         )
-        console.print(f"[dim]Received response: {response.content[0].text}[/dim]")
         
         # Handle different response content types
         try:
             if isinstance(response.content, TextBlock):
-                # Convert TextBlock to string, clean it to ensure it contains only the JSON part
                 content_str = str(response.content[0].text)
                 print(f"Received response: {content_str}")
-                # Find JSON array in the response
                 json_start = content_str.find('[')
                 json_end = content_str.rfind(']') + 1
                 if json_start != -1 and json_end != -1:
                     json_str = content_str[json_start:json_end]
                     parsed_content = json.loads(json_str)
-                    if isinstance(parsed_content, list):
-                        file_summaries.extend(parsed_content)
-                    else:
-                        file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
+                    
+                    # Handle requests for more context
+                    for item in parsed_content:
+                        if item.get('needs_more_context'):
+                            additional_context = await get_additional_context(
+                                item['path'], 
+                                item['needs_more_context']
+                            )
+                            # Make another API call with additional context
+                            item['relevance'] = await get_relevance_with_context(
+                                item['path'],
+                                additional_context,
+                                task_description
+                            )
+                    
+                    file_summaries.extend(parsed_content)
                 else:
-                    # If no JSON array found, use medium relevance
                     file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
             else:
-                # Unknown content type, fallback to medium relevance
                 file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
-        except (json.JSONDecodeError, ValueError, AttributeError) as e:
+        except Exception as e:
             logging.error(f"Error processing response: {str(e)}")
             console.print(f"[red]Error processing response: {str(e)}[/red]")
-            # Fallback to medium relevance if parsing fails
             file_summaries.extend([{'path': f['path'], 'relevance': 'medium'} for f in batch])
     
     return file_summaries
+
+async def get_additional_context(file_path: str, context_request: str) -> dict:
+    """
+    Get additional context from a file based on the AI's request.
+    
+    Args:
+        file_path: Path to the file
+        context_request: String describing what context is needed (e.g., "lines 50-100" or "function X")
+    
+    Returns:
+        dict: Contains the requested context and metadata
+    """
+    try:
+        if 'lines' in context_request.lower():
+            # Extract line numbers from request
+            matches = re.findall(r'lines?\s*(\d+)(?:\s*-\s*(\d+))?', context_request.lower())
+            if matches:
+                start = int(matches[0][0])
+                end = int(matches[0][1]) if matches[0][1] else start + 20
+                content = await read_file_snippet(file_path, start - 1, end - start + 1)
+                return {
+                    'type': 'lines',
+                    'range': f"{start}-{end}",
+                    'content': content
+                }
+        else:
+            # If no specific lines requested, provide more surrounding context
+            content = await read_file_content(file_path)
+            return {
+                'type': 'full_file',
+                'content': content
+            }
+    except Exception as e:
+        logging.error(f"Error getting additional context: {str(e)}")
+        return {
+            'type': 'error',
+            'error': str(e)
+        }
+
+async def get_relevance_with_context(file_path: str, context: dict, task_description: str) -> str:
+    """
+    Make another API call to determine relevance with additional context.
+    """
+    message = {
+        "role": "user",
+        "content": f"""Task: {task_description}
+
+Additional context requested for {file_path}:
+{json.dumps(context, indent=2)}
+
+Please analyze this additional context and provide a final relevance rating ("high", "medium", or "low").
+"""
+    }
+    
+    try:
+        response = await client.messages.create(
+            max_tokens=1024,
+            messages=[message],
+            model="claude-3-5-sonnet-latest"
+        )
+        
+        content = response.content[0].text.lower()
+        if 'high' in content:
+            return 'high'
+        elif 'medium' in content:
+            return 'medium'
+        else:
+            return 'low'
+    except Exception as e:
+        logging.error(f"Error getting relevance with context: {str(e)}")
+        return 'medium'
 
 async def generate_task_plan(task_description, codebase_summary):
     """
@@ -325,7 +376,21 @@ async def generate_task_plan(task_description, codebase_summary):
 Relevant Files Analysis:
 {json.dumps(enhanced_summary, indent=2)}
 
-Please provide a JSON object that strictly adheres to the following format. The JSON must have exactly three top-level keys: 'explanation', 'files_modified', and 'codebase_analysis'. 'explanation' should be a string that briefly describes the task and approach. 'files_modified' should be an array where each element is either a string (representing the file path) or an object with the keys 'path' and 'description' that explain why the file needs modification. 'codebase_analysis' should be either a string or an object containing the keys 'current_state' and 'recommendations'. No additional keys are allowed."""
+Please provide a JSON object that strictly adheres to the following format. The JSON must have exactly three top-level keys: 'explanation', 'files_modified', and 'codebase_analysis'.
+
+- 'explanation' should be a string that briefly describes the task and approach.
+- 'files_modified' must be an array where each element is an object with the following keys:
+    - 'path': the file path
+    - 'changes': an array of change objects, each with:
+        - 'line_range': a string indicating the line numbers to be modified (e.g., "503-506")
+        - 'action': a string describing the type of modification ("Replace", "Rewrite", "Remove", etc.)
+        - 'description': a string explaining what change should be made and why
+        - 'code': (optional) the actual code changes to be made, if applicable
+- 'codebase_analysis' should be an object containing:
+    - 'current_state': a string describing the current implementation
+    - 'recommendations': an array of specific recommendations for improvement
+
+No additional keys are allowed in the JSON response. The response must be valid JSON."""
     }
     
     response = await client.messages.create(
@@ -392,36 +457,56 @@ def validate_json_schema(data: dict) -> bool:
             "type": list,
             "required": True,
             "items": {
-                "type": (str, dict),
-                "dict_keys": ["path", "description"]
+                "type": dict,
+                "required_keys": ["path", "changes"],
+                "changes_schema": {
+                    "type": list,
+                    "items": {
+                        "type": dict,
+                        "required_keys": ["line_range", "action", "description"]
+                    }
+                }
             }
         },
         "codebase_analysis": {
-            "type": (str, dict),
+            "type": dict,
             "required": True,
-            "dict_keys": ["current_state", "recommendations"] if isinstance(data.get("codebase_analysis"), dict) else None
+            "required_keys": ["current_state", "recommendations"]
         }
     }
     
+    # Validate top-level structure
     for key, schema in required_schema.items():
         if schema["required"] and key not in data:
             return False
-        
+            
         if key in data:
             value = data[key]
             if not isinstance(value, schema["type"]):
                 return False
                 
-            if isinstance(value, list) and "items" in schema:
-                for item in value:
-                    if not isinstance(item, schema["items"]["type"]):
+            # Validate files_modified array
+            if key == "files_modified":
+                for file_mod in value:
+                    if not isinstance(file_mod, dict):
                         return False
-                    if isinstance(item, dict) and "dict_keys" in schema["items"]:
-                        if not all(k in item for k in schema["items"]["dict_keys"]):
+                    if not all(k in file_mod for k in schema["items"]["required_keys"]):
+                        return False
+                    # Validate changes array
+                    changes = file_mod.get("changes", [])
+                    if not isinstance(changes, list):
+                        return False
+                    for change in changes:
+                        if not isinstance(change, dict):
+                            return False
+                        if not all(k in change for k in schema["items"]["changes_schema"]["items"]["required_keys"]):
                             return False
                             
-            if isinstance(value, dict) and schema.get("dict_keys"):
-                if not all(k in value for k in schema["dict_keys"]):
+            # Validate codebase_analysis structure
+            elif key == "codebase_analysis":
+                if not all(k in value for k in schema["required_keys"]):
+                    return False
+                if not isinstance(value["recommendations"], (list, str)):
                     return False
     
     return True
@@ -490,11 +575,17 @@ Please provide a corrected JSON object that STRICTLY follows this schema:
 {{
     "explanation": "string describing the task and approach",
     "files_modified": [
-        // Each item must be either a string or an object with "path" and "description"
+        // Each item must be either a string or an object with "path" and "changes"
         "path/to/file.ext",
         {{
             "path": "path/to/file.ext",
-            "description": "why this file needs modification"
+            "changes": [
+                {{
+                    "line_range": "line_range",
+                    "action": "action",
+                    "description": "why this file needs modification"
+                }}
+            ]
         }}
     ],
     "codebase_analysis": {{
@@ -703,76 +794,46 @@ async def display_final_plan(plan: str):
             console.print(Panel(explanation, title="Task Explanation", border_style="blue"))
             console.print()
             
-            # Display files to be modified as a bullet list.
+            # Display files to be modified with their changes
             files_modified = plan_data.get("files_modified", [])
             if files_modified:
-                files_list = "\n".join(
-                    f"- {f}" if isinstance(f, str)
-                    else f"- {f.get('path', 'Unknown')}: {f.get('description', 'No description provided')}"
-                    for f in files_modified
-                )
-            else:
-                files_list = "No files to be modified."
-            console.print(Panel(files_list, title="Files to be Modified", border_style="magenta"))
-            console.print()
+                files_table = Table(title="Files to be Modified", show_header=True, header_style="bold magenta")
+                files_table.add_column("File Path", style="cyan")
+                files_table.add_column("Changes", style="green")
+                
+                for file in files_modified:
+                    if isinstance(file, dict):
+                        path = file.get('path', 'Unknown')
+                        changes = file.get('changes', [])
+                        changes_text = ""
+                        for change in changes:
+                            changes_text += f"• Lines {change.get('line_range', 'N/A')}: "
+                            changes_text += f"{change.get('action', 'N/A')} - "
+                            changes_text += f"{change.get('description', 'No description')}\n"
+                        files_table.add_row(path, changes_text.strip())
+                    else:
+                        files_table.add_row(str(file), "No changes specified")
+                
+                console.print(files_table)
+                console.print()
 
-            # Improved dynamic formatting for recommended_changes
-            if "recommended_changes" in plan_data:
-                changes = plan_data["recommended_changes"]
-                bullet_changes = []
-                for category, items in changes.items():
-                    bullet_changes.append(f"• [bold]{category}[/bold]:")
-                    if isinstance(items, dict):
-                        count = 1
-                        for k, v in items.items():
-                            bullet_changes.append(f"    {count}. {k}: {v}")
-                            count += 1
-                    elif isinstance(items, list):
-                        for index, item in enumerate(items, start=1):
-                            bullet_changes.append(f"    {index}. {item}")
-                    else:
-                        bullet_changes.append(f"    1. {items}")
-                analysis_str = "\n".join(bullet_changes)
-                console.print(Panel(analysis_str, title="Recommended Changes", border_style="green"))
+            # Display codebase analysis
+            analysis = plan_data.get("codebase_analysis", {})
+            if isinstance(analysis, dict):
+                current_state = analysis.get('current_state', 'No current state information available')
+                recommendations = analysis.get('recommendations', [])
+                
+                console.print(Panel(current_state, title="Current State", border_style="yellow"))
+                console.print()
+                
+                if recommendations:
+                    rec_table = Table(title="Recommendations", show_header=False, box=None)
+                    rec_table.add_column("", style="green")
+                    for rec in recommendations:
+                        rec_table.add_row(f"• {rec}")
+                    console.print(rec_table)
             else:
-                # Restored original codebase_analysis formatting
-                analysis = plan_data.get("codebase_analysis", {})
-                if isinstance(analysis, dict):
-                    analysis_lines = []
-                    for section, details in analysis.items():
-                        analysis_lines.append(f"- {section}:")
-                        if isinstance(details, list):
-                            for detail in details:
-                                analysis_lines.append(f"    • {detail}")
-                        elif isinstance(details, dict):
-                            for key, value in details.items():
-                                analysis_lines.append(f"    • {key}: {value}")
-                        else:
-                            analysis_lines.append(f"    • {details}")
-                    analysis_str = "\n".join(analysis_lines)
-                elif isinstance(analysis, str):
-                    analysis_str = analysis
-                else:
-                    analysis_str = "No codebase analysis available."
-                console.print(Panel(analysis_str, title="Codebase Analysis", border_style="green"))
-            
-            # Format additional dynamic sections if available
-            additional_keys = ["current_issues", "recommended_improvements", "implementation_approach"]
-            for key in additional_keys:
-                if key in plan_data:
-                    content = plan_data[key]
-                    section_lines = []
-                    section_lines.append(f"- {key}:")
-                    if isinstance(content, list):
-                        for i, item in enumerate(content, start=1):
-                            section_lines.append(f"    {i}. {item}")
-                    elif isinstance(content, dict):
-                        for i, (subkey, subvalue) in enumerate(content.items(), start=1):
-                            section_lines.append(f"    {i}. {subkey}: {subvalue}")
-                    else:
-                        section_lines.append(f"    1. {content}")
-                    section_str = "\n".join(section_lines)
-                    console.print(Panel(section_str, title=key.replace('_', ' ').title(), border_style="cyan"))
+                console.print(Panel(str(analysis), title="Codebase Analysis", border_style="yellow"))
 
             console.print("\n[bold green]Please review the plan and proceed with the necessary actions.[/bold green]")
     except Exception as e:
@@ -786,10 +847,14 @@ async def display_final_plan(plan: str):
         ))
 
 async def main():
-    from persistent_cache import init_persistent_cache  # Newly added import
-    await init_persistent_cache()  # Initialize the persistent cache once the event loop is running
+    from persistent_cache import init_persistent_cache, get_cache, set_cache
+    await init_persistent_cache()
     task_description = input("Enter the task description: ")
-    codebase_summary = await explore_codebase(task_description=task_description)
+    codebase_summary = await explore_codebase(
+        task_description=task_description,
+        get_cache=get_cache,
+        set_cache=set_cache
+    )
     console.print(f"[green]Found {len(codebase_summary)} relevant files in the codebase.[/green]")
     plan = await generate_task_plan(task_description, codebase_summary)
     valid_plan = await validate_ai_response(plan)
