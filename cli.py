@@ -802,9 +802,17 @@ async def display_final_plan(plan: str):
                 files_table.add_column("File Path", style="cyan")
                 files_table.add_column("Changes", style="green")
                 
+                import os
+                previous_group = None
                 for file in files_modified:
                     if isinstance(file, dict):
                         path = file.get('path', 'Unknown')
+                        # Group files using the file basename (excluding extension)
+                        current_group = os.path.splitext(os.path.basename(path))[0]
+                        if previous_group is not None and current_group != previous_group:
+                            # Insert a blank row to dynamically add space/indent between different file groups
+                            files_table.add_row("", "")
+                        previous_group = current_group
                         changes = file.get('changes', [])
                         changes_text = ""
                         for change in changes:
