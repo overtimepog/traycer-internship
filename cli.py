@@ -369,6 +369,7 @@ async def generate_task_plan(task_description, codebase_summary):
         }
         enhanced_summary.append(summary)
     
+    # Updated message to the AI to require detailed change descriptions (at least 2 sentences)
     message = {
         "role": "user",
         "content": f"""Task: {task_description}
@@ -384,7 +385,7 @@ Please provide a JSON object that strictly adheres to the following format. The 
     - 'changes': an array of change objects, each with:
         - 'line_range': a string indicating the line numbers to be modified (e.g., "503-506")
         - 'action': a string describing the type of modification ("Replace", "Rewrite", "Remove", etc.)
-        - 'description': a string explaining what change should be made and why
+        - 'description': a detailed string explaining what change should be made and why it is needed. **This explanation must be at least two sentences long, offering specific details about the modifications and the reasoning behind them.**
         - 'code': (optional) the actual code changes to be made, if applicable
 - 'codebase_analysis' should be an object containing:
     - 'current_state': a string describing the current implementation
