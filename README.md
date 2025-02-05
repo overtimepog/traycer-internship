@@ -4,6 +4,9 @@
 
 This project is a powerful, asynchronous tool designed to analyze a codebase, identify key files and code snippets through keyword scanning, and generate a detailed task plan with actionable recommendations. It leverages advanced file processing, persistent caching, and AI-driven analysis to assist developers in optimizing and improving their codebases.
 
+**New Executable Version:**  
+In addition to running the application via Python, a packaged executable (.exe) is now available. You can drag this .exe file into any folder on your file system, open it, and after providing a task description, it will just work without any additional configuration.
+
 ## Key Features
 
 - **Asynchronous File Processing**: Utilizes asynchronous I/O via aiofiles to efficiently process large codebases without blocking.
@@ -12,6 +15,7 @@ This project is a powerful, asynchronous tool designed to analyze a codebase, id
 - **AI-Driven Task Planning**: Integrates with the Anthropic AI API (using AsyncAnthropic) to produce comprehensive task plans that include recommendations and potential code modifications.
 - **Rich CLI Interface**: Employs the Rich library to render formatted tables, panels, and syntax-highlighted text in the terminal for an enhanced user experience.
 - **Robust Error Handling**: Includes detailed logging and error handling to ensure reliability during file processing and API interactions.
+- **Packaged Executable (.exe)**: The new executable version can be dragged into any folder and run immediately. Just double-click the file, provide your task, and it works seamlessly.
 
 ## Architecture & Components
 
@@ -103,11 +107,14 @@ pip install aiofiles aiosqlite rich python-dotenv anthropic
 
 ## Usage
 
-- Run the CLI application using the following command:
+- **Python Version**:  
+  Run the CLI application using the following command:
+  ```
+  python cli.py
+  ```
 
-```
-python cli.py
-```
+- **Executable Version**:  
+  If you prefer not to use the command line, a packaged executable (.exe) is provided. Simply drag the executable file into any folder on your system and double-click it. The application will open and prompt you for a task description. Once you enter your task, it will analyze your codebase and display a detailed task plan—all without requiring any additional setup.
 
 - Upon execution, the application will prompt you to enter a task description. This description guides the analysis of your codebase. The steps include:
   - Scanning the codebase for relevant files based on keywords extracted from your task description.
