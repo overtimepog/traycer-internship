@@ -6,20 +6,15 @@ from anthropic import AsyncAnthropic
 from anthropic.types import TextBlock
 import json
 from concurrent.futures import ProcessPoolExecutor
-from persistent_cache import get_cache, set_cache  # Import the persistent cache module
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.status import Status
-from pygments.styles.monokai import MonokaiStyle
-from rich.syntax import Syntax, SyntaxTheme
-from rich.style import Style
 from codebase import (
     explore_codebase,
     read_file_content,
     read_file_snippet,
-    scan_file_content,
-    process_file
+    scan_file_content
 )
 
 # Initialize rich console
@@ -27,6 +22,9 @@ console = Console()
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+
+## Add a global executor instance for CPU-bound tasks in the CLI.
+executor = ProcessPoolExecutor(max_workers=4)
 
 def get_api_key():
     """Get the Anthropic API key from environment variables or .env file."""
@@ -57,6 +55,51 @@ try:
 except Exception as e:
     console.print(f"[red]Failed to initialize Anthropic client: {str(e)}[/red]")
     raise
+
+## Global variables to accumulate token usage from Anthropic API calls
+total_prompt_tokens = 0
+total_completion_tokens = 0
+
+def print_anthropic_cost():
+    input_cost = total_prompt_tokens * 0.000003  # $3 per million input tokens
+    output_cost = total_completion_tokens * 0.000015  # $15 per million output tokens
+    total_cost = input_cost + output_cost
+    console.print(f"\n[bold cyan]Input tokens: {total_prompt_tokens}[/bold cyan]")
+    console.print(f"[bold cyan]Output tokens: {total_completion_tokens}[/bold cyan]")
+    console.print(f"[bold cyan]Total cost: ${total_cost:.6f}[/bold cyan]")
+
+async def anthropic_message_create(*args, **kwargs):
+    """
+    Wrapper for client.messages.create that accumulates the token usage.
+    Assumes the response has a 'usage' or 'meta' attribute that contains 'total_tokens'.
+    """
+    global total_prompt_tokens, total_completion_tokens
+    response = await client.messages.create(*args, **kwargs)
+    #print("Response: ", response)
+    try:
+        usage = getattr(response, "usage", None)
+        #print("Usage: ", usage)
+        if not usage:
+            # Fallback to meta if usage is not available
+            #print("No usage found in response")
+            usage = getattr(response, "meta", None)
+        if usage is not None:
+            if hasattr(usage, "input_tokens"):
+                total_prompt_tokens += usage.input_tokens
+                #print("Total prompt tokens: ", total_prompt_tokens)
+            elif isinstance(usage, dict) and "prompt_tokens" in usage:
+                total_prompt_tokens += usage["prompt_tokens"]
+                #print("Total prompt tokens (dict): ", total_prompt_tokens)
+
+            if hasattr(usage, "output_tokens"):
+                total_completion_tokens += usage.output_tokens
+                #print("Total completion tokens: ", total_completion_tokens)
+            elif isinstance(usage, dict) and "completion_tokens" in usage:
+                total_completion_tokens += usage["completion_tokens"]
+                #print("Total completion tokens (dict): ", total_completion_tokens)
+    except Exception as e:
+        logging.error(f"Error retrieving token usage: {e}")
+    return response
 
 def count_calls(func):
     def wrapper(*args, **kwargs):
@@ -232,7 +275,7 @@ For each file, respond with a JSON array of objects containing:
 """
         }
         
-        response = await client.messages.create(
+        response = await anthropic_message_create(
             max_tokens=4096,  # Increased token limit for larger responses
             messages=[message],
             model="claude-3-5-sonnet-latest"
@@ -329,7 +372,7 @@ Please analyze this additional context and provide a final relevance rating ("hi
     }
     
     try:
-        response = await client.messages.create(
+        response = await anthropic_message_create(
             max_tokens=1024,
             messages=[message],
             model="claude-3-5-sonnet-latest"
@@ -394,7 +437,7 @@ Please provide a JSON object that strictly adheres to the following format. The 
 No additional keys are allowed in the JSON response. The response must be valid JSON."""
     }
     
-    response = await client.messages.create(
+    response = await anthropic_message_create(
         max_tokens=1024,
         messages=[message],
         model="claude-3-5-sonnet-latest"
@@ -446,6 +489,14 @@ def transform_plan_format(plan_obj: dict) -> dict:
         "codebase_analysis": json.dumps(plan_obj, indent=2)
     }
     return new_plan
+
+async def async_transform_plan_format(plan_obj: dict) -> dict:
+    """
+    Offload the synchronous transform_plan_format function to a separate process.
+    This uses the ProcessPoolExecutor to avoid blocking the event loop.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, transform_plan_format, plan_obj)
 
 def validate_json_schema(data: dict) -> bool:
     """Validate that the JSON data follows the required schema."""
@@ -608,7 +659,7 @@ Raw content to fix:
     }
     
     try:
-        response = await client.messages.create(
+        response = await anthropic_message_create(
             max_tokens=1024,
             messages=[message],
             model="claude-3-5-sonnet-latest"
@@ -653,7 +704,7 @@ async def correct_recommended_changes(raw_changes: dict) -> dict:
     }
     
     try:
-        response = await client.messages.create(
+        response = await anthropic_message_create(
             max_tokens=1024,
             messages=[message],
             model="claude-3-5-sonnet-latest"
@@ -868,6 +919,7 @@ async def main():
     plan = await generate_task_plan(task_description, codebase_summary)
     valid_plan = await validate_ai_response(plan)
     await display_final_plan(valid_plan)
+    print_anthropic_cost()
 
 if __name__ == "__main__":
     asyncio.run(main())

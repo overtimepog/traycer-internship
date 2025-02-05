@@ -36,26 +36,30 @@ This project is a powerful, asynchronous tool designed to analyze a codebase, id
   - Retrieves the Anthropic API key from environment variables or a `.env` file to authenticate API requests.
 
 - **User Interaction**:
-  - Prompts the user for a task description, which guides the codebase exploration and analysis process.
+  - Prompts the user for a task description, guiding the codebase exploration and AI analysis.
 
 - **File Analysis & Task Generation**:
-  - Invokes `explore_codebase` to assess and index relevant files.
-  - Bundles file data and sends it to the Anthropic API to generate a detailed task plan containing explanations, recommended modifications, and a codebase analysis.
+  - Invokes `explore_codebase` to index relevant files.
+  - Bundles file data and interacts with the Anthropic API (via a custom wrapper) to generate a detailed task plan that includes change recommendations.
 
 - **Task Plan Formatting & Display**:
-  - The AI-generated plan is validated against a strict JSON schema and formatted into three core sections:
-    - **explanation**: A brief overview of the task and approach.
-    - **files_modified**: Detailed suggestions for file modifications, including line ranges, actions, and descriptions.
-    - **codebase_analysis**: An assessment of the current codebase state along with targeted recommendations.
-  - Utilizes Rich components (Tables, Panels, etc.) for a polished terminal display.
+  - Validates the AI-generated plan against a strict JSON schema and formats it into three core sections:
+    - **explanation**: An overview of the task and approach.
+    - **files_modified**: Detailed file modifications with line ranges, actions, and descriptions (now requiring at least two sentences).
+    - **codebase_analysis**: An assessment of the current implementation with targeted recommendations.
+  - Uses Rich components for a polished terminal presentation.
 
-- **Retry Logic & Validation**:
-  - Implements retry and correction mechanisms to ensure the AI response adheres to the expected JSON format.
+- **Global Token Aggregator**:
+  - A global aggregator tracks and accumulates Anthropic API token usage during execution.
+  - After generating the final plan, the total token count is printed to help monitor API usage costs.
+
+- **Offloading CPU‑Bound Tasks**:
+  - The CLI now leverages a global `ProcessPoolExecutor` along with an async wrapper function to offload CPU‑intensive tasks (such as plan transformations) from the event loop.
 
 ### 3. Persistent Caching (persistent_cache.py)
 
 - **SQLite-Based Cache**:
-  - Initializes a SQLite database `cache.db` to store file analysis results, ensuring that frequently accessed data is quickly retrievable.
+  - Initializes a SQLite database `cache.db` to store file analysis results. If a file is read from this cache, a console message is printed indicating that no tokens are used for that file.
 
 - **Cache Operations**:
   - **get_cache**: Retrieves cached data based on a unique key (generated from the file path and modified time).

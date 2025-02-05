@@ -173,6 +173,8 @@ async def explore_codebase(root_dir: str = '.', task_description: str = '',
                 cached_result = await get_cache(cache_key)
                 
                 if cached_result:
+                    # Print a message indicating the file is being read from the persistent cache (SQLite)
+                    print(f"[INFO] File read from persistent cache: {file_path} (no tokens used)")
                     if is_target_file:
                         cached_result['importance'] = 'high'
                     tasks.append(asyncio.create_task(return_cached(cached_result)))
