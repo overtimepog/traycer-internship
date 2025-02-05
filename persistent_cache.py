@@ -151,9 +151,6 @@ async def evict_lru_entries(db, required_space: int):
         logger.error(f"Error during cache eviction: {e}")
         raise
 
-# Remove or comment out the global initialization below:
-# asyncio.create_task(init_db())
-
 # Add the following initialization function:
 async def init_persistent_cache():
     return await init_db()
